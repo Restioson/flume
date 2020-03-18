@@ -23,6 +23,7 @@ use std::{
     thread,
 };
 use std::sync::{Condvar, Mutex};
+use futures::task::Waker;
 
 /// An error that may be emitted when attempting to send a value into a channel on a sender.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -82,6 +83,7 @@ struct Shared<T> {
     wait_lock: Mutex<bool>,
     send_trigger: Condvar,
     recv_trigger: Condvar,
+    waker: spin::Mutex<Option<Waker>>,
     /// The number of senders associated with this channel. If this drops to 0, the channel is
     /// 'dead' and the listener will begin reporting disconnect errors (once the queue has been
     /// drained).
@@ -473,6 +475,7 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         wait_lock: Mutex::new(false),
         send_trigger: Condvar::new(),
         recv_trigger: Condvar::new(),
+        waker: spin::Mutex::new(None),
         senders: AtomicUsize::new(1),
         send_waiters: AtomicUsize::new(0),
         listen_mode: AtomicUsize::new(1),
@@ -511,6 +514,7 @@ pub fn bounded<T>(n: usize) -> (Sender<T>, Receiver<T>) {
         wait_lock: Mutex::new(false),
         send_trigger: Condvar::new(),
         recv_trigger: Condvar::new(),
+        waker: spin::Mutex::new(None),
         senders: AtomicUsize::new(1),
         send_waiters: AtomicUsize::new(0),
         listen_mode: AtomicUsize::new(1),

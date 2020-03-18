@@ -96,11 +96,13 @@ impl<T> Shared<T> {
             } else if listen_mode > 1 {
                 // Notify the receiver of a new message if listeners are waiting
                 let _ = self.wait_lock.lock().unwrap();
+                let guard = self.waker.lock();
                 // Drop the queue early to avoid a deadlock
                 drop(queue);
-                if let Some(waker) = &*self.waker.lock() {
+                if let Some(waker) = &*guard {
                     waker.wake_by_ref()
                 }
+                drop(guard);
             }
             Ok(())
         }
@@ -125,13 +127,16 @@ impl<T> Shared<T> {
                     } else if listen_mode > 1 {
                         // If listen_mode is greater than one it means that the receiver is passively
                         // waiting on a notification that new items have entered the queue.
-                        let _ = self.wait_lock.lock().unwrap();
-                        // Drop the queue early to avoid deadlocking when notifying the receiver.
+                        // let _ = self.wait_lock.lock().unwrap();
+                        // Drop the queue early to avoid a deadlock
                         drop(queue);
                         // Tell the receiver to wake up
-                        if let Some(waker) = &*self.waker.lock() {
+                        let guard = self.waker.lock();
+                        if let Some(waker) = &*guard {
                             waker.wake_by_ref()
                         }
+
+                        drop(guard);
                         break Ok(());
                     } else {
                         break Ok(());
@@ -165,9 +170,11 @@ impl<T> Shared<T> {
     fn all_senders_disconnected(&self) {
         let mut disconnected = self.wait_lock.lock().unwrap();
         *disconnected = true;
-        if let Some(waker) = &*self.waker.lock() {
+        let guard = self.waker.lock();
+        if let Some(waker) = &*guard {
             waker.wake_by_ref()
         }
+        drop(guard);
     }
 
     fn receiver_disconnected(&self) {
@@ -225,7 +232,9 @@ impl<'a, T> Future for RecvFuture<'a, T> {
     type Output = Result<T, RecvError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        *self.shared.waker.lock() = Some(cx.waker().clone());
+        {
+            *self.shared.waker.lock() = Some(cx.waker().clone());
+        }
         // Attempt to gain exclusive access to the queue
         if let Some(mut queue) = self.shared.queue.try_lock() {
             match queue.pop() {
@@ -240,25 +249,22 @@ impl<'a, T> Future for RecvFuture<'a, T> {
                         drop(queue);
                         self.shared.recv_trigger.notify_one();
                     }
-                    return Poll::Ready(Ok(msg))
+                    Poll::Ready(Ok(msg))
                 },
                 // No messages left, and there are no more senders, so our work here is done.
                 None if self.disconnected => {
                     *self.shared.waker.lock() = None;
-                    return Poll::Ready(Err(RecvError::Disconnected))
+                    Poll::Ready(Err(RecvError::Disconnected))
                 },
                 // Sleep when empty
                 None => {
                     // Indicate to future senders that we'll need to be woken up
                     self.shared.listen_mode.store(2, Ordering::Relaxed);
+                    Poll::Pending
                 },
             }
-        }
-
-        if self.disconnected {
-            *self.shared.waker.lock() = None;
-            Poll::Ready(Err(RecvError::Disconnected))
         } else {
+            cx.waker().wake_by_ref();
             Poll::Pending
         }
     }
