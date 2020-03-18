@@ -8,6 +8,7 @@ use std::sync::{Condvar, Mutex};
 use std::task::{Waker, Context, Poll};
 use std::future::Future;
 use std::pin::Pin;
+use futures::sink::Sink;
 
 /// An error that may be emitted when attempting to send a value into a channel on a sender.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -226,19 +227,19 @@ impl<'a, T> Future for RecvFuture<'a, T> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         *self.shared.waker.lock() = Some(cx.waker().clone());
         // Attempt to gain exclusive access to the queue
-        let guard = if let Some(mut queue) = self.shared.queue.try_lock() {
+        if let Some(mut queue) = self.shared.queue.try_lock() {
             match queue.pop() {
                 // We've got the message we wanted
                 Some(msg) => {
+                    *self.shared.waker.lock() = None;
+                    // Ensure the listen mode is reset
+                    // TODO: Are we performing more atomic stores than we need to here?
+                    self.shared.listen_mode.store(1, Ordering::Release);
                     if queue.1.is_some() && self.shared.send_waiters.load(Ordering::Relaxed) > 0 {
                         let _ = self.shared.wait_lock.lock().unwrap();
                         drop(queue);
                         self.shared.recv_trigger.notify_one();
                     }
-                    // Ensure the listen mode is reset
-                    // TODO: Are we performing more atomic stores than we need to here?
-                    self.shared.listen_mode.store(1, Ordering::Release);
-                    *self.shared.waker.lock() = None;
                     return Poll::Ready(Ok(msg))
                 },
                 // No messages left, and there are no more senders, so our work here is done.
@@ -248,24 +249,11 @@ impl<'a, T> Future for RecvFuture<'a, T> {
                 },
                 // Sleep when empty
                 None => {
-                    // Indicate to future senders that we'll need to be woken up since we're
-                    // going to wait upon the condvar trigger.
+                    // Indicate to future senders that we'll need to be woken up
                     self.shared.listen_mode.store(2, Ordering::Relaxed);
-                    // Take a guard of the mutex, but do so while the queue is still locked.
-                    // This prevents a deadlock situation occurring.
-                    Some(self.shared.wait_lock.lock().unwrap())
                 },
             }
-        } else {
-            // If we can't access the queue yet, revert to using the old guard (if it exists)
-            None//guard
-        };
-
-        // Check to see whether senders still exist
-        self.disconnected |= guard
-            .as_ref()
-            .map(|guard| **guard)
-            .unwrap_or(false);
+        }
 
         if self.disconnected {
             *self.shared.waker.lock() = None;
@@ -279,6 +267,11 @@ impl<'a, T> Future for RecvFuture<'a, T> {
 /// A transmitting end of a channel.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
+}
+
+pub enum SinkSendError<T> {
+    PollReadyDisconnected,
+    Disconnected(T),
 }
 
 impl<T> Sender<T> {
@@ -295,6 +288,31 @@ impl<T> Sender<T> {
         self.shared.try_send(msg)
     }
 }
+
+// impl<T> Sink<T> for Sender<T> {
+//     type Error = SinkSendError<T>;
+//
+//     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+//         let disconnected = *(*self).shared.wait_lock.lock().unwrap();
+//         if disconnected {
+//             Poll::Ready(Ok(()))
+//         } else {
+//             Poll::Ready(Err(SinkSendError::PollReadyDisconnected))
+//         }
+//     }
+//
+//     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+//         self.send(item).map_err()
+//     }
+//
+//     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+//         unimplemented!()
+//     }
+//
+//     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+//         unimplemented!()
+//     }
+// }
 
 impl<T> Clone for Sender<T> {
     /// Clone this sender. [`Sender`] acts as a handle to a channel, and the channel will only be
