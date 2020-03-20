@@ -27,12 +27,28 @@ impl<'a, T> Future for RecvFuture<'a, T> {
         #[cfg(feature = "receiver_buffer")]
         let mut buf = self.recv.buffer.borrow_mut();
 
-        let res = self
-            .recv
-            .shared
-            .try_recv(
-                #[cfg(feature = "receiver_buffer")] &mut buf
-            );
+        #[cfg(feature = "receiver_buffer")]
+        {
+            if let Some(msg) = buf.pop_front() {
+                return Poll::Ready(Ok(msg));
+            }
+        }
+
+        let mut inner = match self.recv.shared.inner.try_lock() {
+            Some(guard) => guard,
+            None => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending; // TODO spin some first?
+            },
+        };
+
+        let res = match inner.try_recv(&mut buf) {
+            Ok(msg) => {
+                self.recv.shared.wake_senders(inner);
+                Ok(msg)
+            },
+            Err(e) => Err((inner, e))
+        };
 
         let poll = match res {
             Ok(msg) => {

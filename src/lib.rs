@@ -129,6 +129,41 @@ struct Inner<T> {
     listen_mode: usize,
 }
 
+impl<T> Inner<T> {
+    fn try_recv(
+        &mut self,
+        buf: &mut VecDeque<T>,
+    ) -> Result<T, TryRecvError> {
+        let msg = match self.queue.pop() {
+            Some(msg) => msg,
+            // If there's nothing more in the queue, this might be because there are no senders
+            None if self.sender_count == 0 =>
+                return Err(TryRecvError::Disconnected),
+            None => return Err(TryRecvError::Empty),
+        };
+
+        #[cfg(feature = "receiver_buffer")]
+        {
+            self.queue.swap(buf);
+        }
+
+        #[cfg(feature = "select")]
+        {
+            // Notify send selectors
+            self
+                .send_selectors
+                .iter()
+                .for_each(|(_, signal, token)| {
+                    let mut guard = signal.wait_lock.lock().unwrap();
+                    *guard = Some(*token);
+                    signal.trigger.notify_one();
+                });
+        }
+
+        Ok(msg)
+    }
+}
+
 struct Shared<T> {
     // Mutable state
     inner: spin::Mutex<Inner<T>>,
@@ -300,43 +335,25 @@ impl<T> Shared<T> {
         }
 
         self.with_inner(|mut inner| {
-            let msg = match inner.queue.pop() {
-                Some(msg) => msg,
-                // If there's nothing more in the queue, this might be because there are no senders
-                None if inner.sender_count == 0 =>
-                    return Err((inner, TryRecvError::Disconnected)),
-                None => return Err((inner, TryRecvError::Empty)),
-            };
-
-            #[cfg(feature = "receiver_buffer")]
-            {
-                inner.queue.swap(buf);
+            match inner.try_recv(buf) {
+                Ok(msg) => {
+                    self.wake_senders(inner);
+                    Ok(msg)
+                },
+                Err(e) => Err((inner, e))
             }
-
-            #[cfg(feature = "select")]
-            {
-                // Notify send selectors
-                inner
-                    .send_selectors
-                    .iter()
-                    .for_each(|(_, signal, token)| {
-                        let mut guard = signal.wait_lock.lock().unwrap();
-                        *guard = Some(*token);
-                        signal.trigger.notify_one();
-                    });
-            }
-
-            // If there are senders waiting for a message, wake them up.
-            if let Some(recv_trigger) = self.recv_trigger.as_ref() {
-                if inner.queue.is_bounded() && inner.send_waiters > 0 {
-                    drop(inner);
-                    let _ = self.wait_lock.lock().unwrap();
-                    recv_trigger.notify_one();
-                }
-            }
-
-            Ok(msg)
         })
+    }
+
+    fn wake_senders(&self, inner: spin::MutexGuard<Inner<T>>) {
+        // If there are senders waiting for a message, wake them up.
+        if let Some(recv_trigger) = self.recv_trigger.as_ref() {
+            if inner.queue.is_bounded() && inner.send_waiters > 0 {
+                drop(inner);
+                let _ = self.wait_lock.lock().unwrap();
+                recv_trigger.notify_one();
+            }
+        }
     }
 
     #[inline]
@@ -353,7 +370,7 @@ impl<T> Shared<T> {
                     Ok(msg) => return Ok(msg),
                     Err((_, TryRecvError::Disconnected)) => return Err(RecvError::Disconnected),
                     Err((inner, TryRecvError::Empty)) if i == 3 => break inner,
-                    Err((inner, TryRecvError::Empty)) => {},
+                    Err((_inner, TryRecvError::Empty)) => {},
                 };
                 thread::yield_now();
                 i += 1;
