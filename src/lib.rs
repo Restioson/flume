@@ -85,7 +85,7 @@ impl<T> Signal<T> {
         let guard = self.lock.lock().unwrap();
         self.waiters.fetch_add(1, Ordering::Relaxed);
         drop(sync_guard);
-        let guard = self.trigger.wait(guard).unwrap();
+        let _guard = self.trigger.wait(guard).unwrap();
         self.waiters.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -94,7 +94,7 @@ impl<T> Signal<T> {
         self.waiters.fetch_add(1, Ordering::Relaxed);
         drop(sync_guard);
         first(&mut *guard);
-        let guard = self.trigger.wait_while(guard, cond).unwrap();
+        let _guard = self.trigger.wait_while(guard, cond).unwrap();
         self.waiters.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -111,7 +111,7 @@ impl<T> Signal<T> {
         let guard = self.lock.lock().unwrap();
         self.waiters.fetch_add(1, Ordering::Relaxed);
         drop(sync_guard);
-        let (guard, timeout) = self.trigger.wait_timeout(guard, dur).unwrap();
+        let (_guard, timeout) = self.trigger.wait_timeout(guard, dur).unwrap();
         self.waiters.fetch_sub(1, Ordering::Relaxed);
         timeout
     }
@@ -164,12 +164,7 @@ impl<T> Queue<T> {
     }
 
     fn swap(&mut self, buf: &mut VecDeque<T>) {
-        // TODO: Swapping on bounded queues doesn't work correctly since it gives senders a false
-        // impression of how many items are in the queue, allowing them to push too many items into
-        // the queue
-        if !self.1.is_some() {
-            std::mem::swap(&mut self.0, buf);
-        }
+        std::mem::swap(&mut self.0, buf);
     }
 
     fn take(&mut self) -> Self {
@@ -206,6 +201,9 @@ struct Inner<T> {
 struct Shared<T> {
     // Mutable state
     inner: InnerMutex<Inner<T>>,
+    /// Tracks the queue's length
+    len: AtomicUsize,
+    capacity: Option<usize>,
     /// Used for notifying the receiver about incoming messages.
     send_signal: Signal,
     // Used for notifying senders about the queue no longer being full. Therefore, this is only a
@@ -233,6 +231,8 @@ impl<T> Shared<T> {
                 sender_count: 1,
                 listen_mode: 1,
             }),
+            len: AtomicUsize::new(0),
+            capacity: cap,
             send_signal: Signal::default(),
             recv_signal: if cap.is_some() { Some(Signal::default()) } else { None },
             rendezvous_signal: if cap == Some(0) { Some(Signal::default()) } else { None },
@@ -282,11 +282,17 @@ impl<T> Shared<T> {
             // If the listener has disconnected, the channel is dead
             return Err((inner, TrySendError::Disconnected(msg)));
         }
-        // If pushing fails, it's because the queue is full
-        match inner.queue.push(msg) {
-            Err(msg) => return Err((inner, TrySendError::Full(msg))),
-            Ok(()) => {},
-        };
+
+        if self.capacity.map(|c| self.len.load(Ordering::Acquire) < c).unwrap_or(true) {
+            match inner.queue.push(msg) {
+                Err(msg) => return Err((inner, TrySendError::Full(msg))), // TODO can this happen?
+                Ok(()) => {
+                    self.len.fetch_add(1, Ordering::Release)
+                },
+            };
+        } else {
+            return Err((inner, TrySendError::Full(msg)));
+        }
 
         // TODO: Move this below the listen_mode check by making selectors listen-aware
         #[cfg(feature = "select")]
@@ -371,6 +377,15 @@ impl<T> Shared<T> {
     ) -> Result<T, (MutexGuard<Inner<T>>, TryRecvError)> {
         // Eagerly check the buffer
         if let Some(msg) = buf.pop_front() {
+            // TODO
+            self.len.fetch_sub(1, Ordering::Release);
+
+            // If there are senders waiting for a message, wake them up.
+            if let Some(recv_signal) = self.recv_signal.as_ref() {
+                // Notify the receiver of a new message
+                recv_signal.notify_one(());
+            }
+            
             return Ok(msg);
         }
 
@@ -380,21 +395,27 @@ impl<T> Shared<T> {
         if let Some(rendezvous_signal) = self.rendezvous_signal.as_ref() {
             let mut msg = None;
             rendezvous_signal.notify_one_with(|m| msg = m.take(), ());
-            if let Some(msg) = msg {
-                return Ok(msg);
+            return if let Some(msg) = msg {
+                Ok(msg)
             } else {
-                return Err((inner, TryRecvError::Empty));
+                Err((inner, TryRecvError::Empty))
             }
         }
 
         let msg = match inner.queue.pop() {
-            Some(msg) => msg,
+            Some(msg) => {
+                // TODO
+                self.len.fetch_sub(1, Ordering::Release);
+                msg
+            },
             // If there's nothing more in the queue, this might be because there are no senders
             None if inner.sender_count == 0 => {
                 finished.set(true);
                 return Err((inner, TryRecvError::Disconnected));
             },
-            None => return Err((inner, TryRecvError::Empty)),
+            None => {
+                return Err((inner, TryRecvError::Empty))
+            },
         };
 
         // Swap the buffers to grab the messages
@@ -638,7 +659,11 @@ impl<T> Receiver<T> {
     /// `try_iter`, the iterator will not attempt to fetch any more values from the channel once
     /// the function has been called.
     pub fn drain(&self) -> Drain<T> {
-        Drain { queue: self.shared.take_remaining(), _phantom: PhantomData }
+        // TODO
+        self.shared.len.store(0, Ordering::Release);
+        let mut queue = std::mem::replace(&mut *self.buffer.borrow_mut(), VecDeque::new());
+        queue.append(&mut self.shared.take_remaining().0);
+        Drain { queue, _phantom: PhantomData }
     }
 }
 
@@ -686,7 +711,7 @@ impl<'a, T> Iterator for TryIter<'a, T> {
 
 /// An fixed-sized iterator over the items drained from a channel.
 pub struct Drain<'a, T> {
-    queue: Queue<T>,
+    queue: VecDeque<T>,
     /// A phantom field used to constrain the lifetime of this iterator. We do this because the
     /// implementation may change and we don't want to unintentionally constrain it. Removing this
     /// lifetime later is a possibility.
@@ -697,7 +722,7 @@ impl<'a, T> Iterator for Drain<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.queue.pop()
+        self.queue.pop_front()
     }
 }
 
