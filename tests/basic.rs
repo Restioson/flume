@@ -197,7 +197,7 @@ fn hydra() {
     let (main_tx, main_rx) = unbounded::<u64>();
 
     let mut txs = Vec::new();
-    for _ in 0..thread_num {
+    for t in 0..thread_num {
         let main_tx = main_tx.clone();
         let (tx, rx) = unbounded();
         txs.push(tx);
@@ -205,7 +205,7 @@ fn hydra() {
         std::thread::spawn(move || {
             for msg in rx.iter() {
                 // println!("recvd: {}", msg);
-                main_tx.send(msg, 0).unwrap();
+                main_tx.send(msg, t).unwrap();
                 // println!("    sent on");
             }
         });
@@ -213,9 +213,10 @@ fn hydra() {
 
     drop(main_tx);
 
-    for _ in 0..10000 {
+    for r in 0..10000 {
+        //println!("r {}", r);
         for (t, tx) in txs.iter().enumerate() {
-            println!("tx {}", t);
+            //println!("tx {}", t);
             for i in 0..msg_num {
                 // println!("    sending {}", i);
                 tx.send(i, 1).unwrap();
@@ -223,19 +224,21 @@ fn hydra() {
             }
         }
 
-        println!("all sent");
+       // println!("all sent");
 
         for t in 0..thread_num {
             for _ in 0..msg_num {
-                let x = main_rx.recv().unwrap();
-                if t == 31 { println!("    recvd: {}", x); }
+                //if t == 31 { println!("recving"); }
+                let x = main_rx.recv(false).unwrap();
+                //if t == 31 { println!("    recvd: {}", x); }
             }
-            println!("recvd thread {}", t);
+            // println!("recvd thread {}", t);
         }
+       // println!("done");
     }
 
     drop(txs);
-    assert!(main_rx.recv().is_err());
+    assert!(main_rx.recv(true).is_err());
 }
 
 // TODO
