@@ -87,33 +87,34 @@ impl<T> Signal<T> {
         self.lock.lock().unwrap()
     }
 
-    fn wait<G>(&self, sync_guard: G) {
-        let guard = self.lock.lock().unwrap();
-        self.waiters.fetch_add(1, Ordering::Relaxed);
-        drop(sync_guard);
-        let _guard = self.trigger.wait(guard).unwrap();
-        self.waiters.fetch_sub(1, Ordering::Relaxed);
-    }
+    // TODO
+    // fn wait<G>(&self, sync_guard: G) {
+    //     let guard = self.lock.lock().unwrap();
+    //     self.waiters.fetch_add(1, Ordering::Release);
+    //     drop(sync_guard);
+    //     let _guard = self.trigger.wait(guard).unwrap();
+    //     self.waiters.fetch_sub(1, Ordering::Release);
+    // }
 
     fn wait_timeout<G>(&self, dur: Duration, sync_guard: G) -> WaitTimeoutResult {
         let guard = self.lock.lock().unwrap();
-        self.waiters.fetch_add(1, Ordering::Relaxed);
+        self.waiters.fetch_add(1, Ordering::Release);
         drop(sync_guard);
         let (_guard, timeout) = self.trigger.wait_timeout(guard, dur).unwrap();
-        self.waiters.fetch_sub(1, Ordering::Relaxed);
+        self.waiters.fetch_sub(1, Ordering::Release);
         timeout
     }
 
     fn wait_while<G>(&self, sync_guard: G, cond: impl FnMut(&mut T) -> bool) {
         let guard = self.lock.lock().unwrap();
-        self.waiters.fetch_add(1, Ordering::Relaxed);
+        self.waiters.fetch_add(1, Ordering::Release);
         drop(sync_guard);
         let _guard = self.trigger.wait_while(guard, cond).unwrap();
-        self.waiters.fetch_sub(1, Ordering::Relaxed);
+        self.waiters.fetch_sub(1, Ordering::Release);
     }
 
     fn notify_one<G>(&self, sync_guard: G) {
-        if self.waiters.load(Ordering::Relaxed) > 0 {
+        if self.waiters.load(Ordering::Acquire) > 0 {
             drop(sync_guard);
             let _guard = self.lock.lock().unwrap();
             self.trigger.notify_one();
@@ -121,7 +122,7 @@ impl<T> Signal<T> {
     }
 
     fn notify_one_with<G>(&self, f: impl FnOnce(&mut T), sync_guard: G) {
-        if self.waiters.load(Ordering::Relaxed) > 0 {
+        if self.waiters.load(Ordering::Acquire) > 0 {
             drop(sync_guard);
             let mut guard = self.lock.lock().unwrap();
             f(&mut *guard);
@@ -130,7 +131,7 @@ impl<T> Signal<T> {
     }
 
     fn notify_all<G>(&self, sync_guard: G) {
-        if self.waiters.load(Ordering::Relaxed) > 0 {
+        if self.waiters.load(Ordering::Acquire) > 0 {
             drop(sync_guard);
             let _guard = self.lock.lock().unwrap();
             self.trigger.notify_all();
@@ -209,13 +210,13 @@ impl<T> Shared<T> {
     /// Inform the receiver that all senders have been dropped
     #[inline]
     fn all_senders_disconnected(&self) {
-        self.disconnected.store(true, Ordering::Relaxed);
+        self.disconnected.store(true, Ordering::Release);
         self.send_signal.notify_all(());
     }
 
     #[inline]
     fn receiver_disconnected(&self) {
-        self.disconnected.store(true, Ordering::Relaxed);
+        self.disconnected.store(true, Ordering::Release);
         for receiver in self.chan.receivers.lock().iter() {
             receiver.notify_all(());
         }
@@ -240,7 +241,7 @@ impl<T> Sender<T> {
     /// Send a value into the channel, returning an error if the channel receiver has
     /// been dropped. If the channel is bounded and is full, this method will block.
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
-        if self.shared.disconnected.load(Ordering::Relaxed) {
+        if self.shared.disconnected.load(Ordering::Acquire) {
             return Err(TrySendError::Disconnected(msg));
         }
 
@@ -268,7 +269,6 @@ impl<T> Sender<T> {
             },
             Flavor::Unbounded => {
                 queue.push_back(msg);
-                self.shared.send_signal.notify_one(queue);
                 Ok(())
             },
         }
@@ -277,23 +277,30 @@ impl<T> Sender<T> {
     /// Attempt to send a value into the channel. If the channel is bounded and full, or the
     /// receiver has been dropped, an error is returned. If the channel associated with this
     /// sender is unbounded, this method has the same behaviour as [`Sender::send`].
-    pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
+    pub fn send(&self, msg: T, x: u32) -> Result<(), SendError<T>> {
         let chan = &self.shared.chan;
 
-        if self.shared.disconnected.load(Ordering::Relaxed) {
+        if self.shared.disconnected.load(Ordering::Acquire) {
             return Err(SendError(msg));
         }
 
-        if let (Some(recv), receivers) = {
-            let mut receivers = wait_lock(&chan.receivers);
-            (receivers.pop_front(), receivers)
-        } {
-            debug_assert!(wait_lock(&chan.queue).len() == 0);
+        // if x ==0 { println!("S{}: acquiring receiver lock", x); }
+        let mut receivers = wait_lock(&chan.receivers);
+        if let Some(recv) = receivers.pop_front() {
+            // if x ==0 {println!("S{}: receiver lock acquired", x);}
+            //debug_assert!(wait_lock(&chan.queue).len() == 0);
+            // if x ==0 {println!("S{}: notifying", x);}
             recv.notify_one_with(|m| *m = Some(msg), receivers);
             return Ok(());
+        } else {
+            // if x ==0 {println!("S{}: receiver lock acquired", x);}
         }
 
+        drop(receivers);
+
+        // if x ==0 {println!("S{}: acquiring lock", x);}
         let mut queue = wait_lock(&chan.queue);
+        // if x ==0 {println!("S{}: lock acquired", x);}
         match &chan.flavor {
             Flavor::Bounded { cap, senders } => {
                 if queue.len() < *cap {
@@ -307,17 +314,20 @@ impl<T> Sender<T> {
                 senders.push_back(unblock_signal.clone());
 
                 unblock_signal.wait_while(senders, |msg| {
-                    msg.is_some() && !self.shared.disconnected.load(Ordering::Relaxed)
+                    msg.is_some() && !self.shared.disconnected.load(Ordering::Acquire)
                 });
 
-                if let Some(msg) = unblock_signal.lock().take() {
+                let r = if let Some(msg) = unblock_signal.lock().take() {
                     Err(SendError(msg))
                 } else {
                     Ok(())
-                }
+                };
+                // if x ==0 {println!("S{}: releasing lock", x);}
+                r
             }
             Flavor::Unbounded => {
                 queue.push_back(msg);
+                // if x ==0 {println!("S{}: releasing lock", x);}
                 return Ok(())
             }
         }
@@ -383,9 +393,12 @@ impl<T> Receiver<T> {
     ) -> T {
         receivers.push_back(self.unblock_signal.clone());
         self.unblock_signal.wait_while(receivers, |msg| {
-            msg.is_none() && !self.shared.disconnected.load(Ordering::Relaxed)
+            msg.is_none() && !self.shared.disconnected.load(Ordering::Acquire)
         });
-        self.unblock_signal.lock().take().unwrap()
+        //println!(" R: Locking unblock signal");
+        let r = self.unblock_signal.lock().take().unwrap();
+        //println!(" R: Releasing unblock signal");
+        r
     }
 
     /// Attempt to fetch an incoming value from the channel associated with this receiver,
@@ -400,7 +413,7 @@ impl<T> Receiver<T> {
 
         if let Some(msg) = wait_lock(&chan.queue).pop_front() {
             Ok(msg)
-        } else if self.shared.disconnected.load(Ordering::Relaxed) {
+        } else if self.shared.disconnected.load(Ordering::Acquire) {
             Err(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
@@ -411,18 +424,29 @@ impl<T> Receiver<T> {
     /// error if all channel senders have been dropped.
     pub fn recv(&self) -> Result<T, RecvError> where T: std::fmt::Debug { // TODO Debug
         let chan = &self.shared.chan;
+        //println!(" R:acquiring lock");
         let mut queue = wait_lock(&chan.queue);
+        //println!(" R:lock acquired");
 
-        if let Flavor::Bounded { cap, senders } =  &chan.flavor {
+        if let Flavor::Bounded { cap, senders } = &chan.flavor {
             pull_pending(*cap, &mut queue, &mut wait_lock(&senders));
         }
 
         if let Some(msg) = queue.pop_front() {
-            Ok(msg)
-        } else if self.shared.disconnected.load(Ordering::Relaxed) {
+            //println!(" R:releasing lock");
+            return Ok(msg);
+        }
+
+        drop(queue); // Prevent deadlock
+
+        if self.shared.disconnected.load(Ordering::Acquire) {
+            println!(" R:releasing lock");
             Err(RecvError::Disconnected)
         } else {
-            Ok(self.wait_for_message(wait_lock(&chan.receivers)))
+            //println!(" R:waiting for message");
+            let r = Ok(self.wait_for_message(wait_lock(&chan.receivers)));
+            //println!(" R:releasing lock");
+            r
         }
     }
 
@@ -435,6 +459,7 @@ impl<T> Receiver<T> {
     /// Wait for an incoming value from the channel associated with this receiver, returning an
     /// error if all channel senders have been dropped or the deadline has passed.
     pub fn recv_deadline(&self, deadline: Instant) -> Result<T, RecvTimeoutError> {
+        return todo!(); // TODO dont use send_signal
         let chan = &self.shared.chan;
         match &chan.flavor {
             Flavor::Bounded { cap, senders } => loop {
@@ -442,7 +467,7 @@ impl<T> Receiver<T> {
                 pull_pending(*cap, &mut queue, &mut wait_lock(&senders));
                 if let Some(msg) = queue.pop_front() {
                     break Ok(msg);
-                } else if self.shared.disconnected.load(Ordering::Relaxed) {
+                } else if self.shared.disconnected.load(Ordering::Acquire) {
                     break Err(RecvTimeoutError::Disconnected);
                 } else {
                     let now = Instant::now();
@@ -460,7 +485,7 @@ impl<T> Receiver<T> {
                 let mut queue = wait_lock(&chan.queue);
                 if let Some(msg) = queue.pop_front() {
                     break Ok(msg);
-                } else if self.shared.disconnected.load(Ordering::Relaxed) {
+                } else if self.shared.disconnected.load(Ordering::Acquire) {
                     break Err(RecvTimeoutError::Disconnected);
                 } else {
                     let now = Instant::now();
