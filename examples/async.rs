@@ -18,4 +18,4 @@ async fn main() {
 }
 
 #[cfg(not(feature = "async"))]
-fn main () {}
+fn main() {}

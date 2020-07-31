@@ -1,6 +1,6 @@
 //! Types that permit waiting upon multiple blocking operations using the [`Selector`] interface.
 
-use crate::{*, signal::Signal};
+use crate::{signal::Signal, *};
 
 // A unique token corresponding to an event in a selector
 type Token = usize;
@@ -37,7 +37,7 @@ impl Signal for SelectSignal {
 pub struct Selector<'a, T> {
     selections: Vec<(
         Box<dyn FnMut() -> Option<T> + 'a>, // Poll
-        Box<dyn FnMut() + 'a>, // Drop
+        Box<dyn FnMut() + 'a>,              // Drop
     )>,
     next_poll: usize,
     signalled: Arc<Spinlock<VecDeque<Token>>>,
@@ -57,9 +57,16 @@ impl<'a, T> Selector<'a, T> {
     ///
     /// Once added, the selector can be used to run the provided handler function on completion of
     /// this operation.
-    pub fn send<U>(mut self, sender: &'a Sender<U>, msg: U, mut f: impl FnMut(Result<(), SendError<U>>) -> T + 'a) -> Self {
+    pub fn send<U>(
+        mut self,
+        sender: &'a Sender<U>,
+        msg: U,
+        mut f: impl FnMut(Result<(), SendError<U>>) -> T + 'a,
+    ) -> Self {
         let token = self.selections.len();
-        let selector_id = sender.shared.connect_send_selector(self.signal.clone(), token);
+        let selector_id = sender
+            .shared
+            .connect_send_selector(self.signal.clone(), token);
         let mut msg = Some(msg);
         self.selections.push((
             Box::new(move || {
@@ -68,15 +75,15 @@ impl<'a, T> Selector<'a, T> {
                         Ok(()) => {
                             msg = None;
                             Some((&mut f)(Ok(())))
-                        },
+                        }
                         Err(TrySendError::Disconnected(m)) => {
                             msg = None;
                             Some((&mut f)(Err(SendError(m))))
-                        },
+                        }
                         Err(TrySendError::Full(m)) => {
                             msg = Some(m);
                             None
-                        },
+                        }
                     }
                 } else {
                     None
@@ -91,12 +98,17 @@ impl<'a, T> Selector<'a, T> {
     ///
     /// Once added, the selector can be used to run the provided handler function on completion of
     /// this operation.
-    pub fn recv<U>(mut self, receiver: &'a Receiver<U>, mut f: impl FnMut(Result<U, RecvError>) -> T + 'a) -> Self {
+    pub fn recv<U>(
+        mut self,
+        receiver: &'a Receiver<U>,
+        mut f: impl FnMut(Result<U, RecvError>) -> T + 'a,
+    ) -> Self {
         let token = self.selections.len();
 
-        self.selections.
-
-        receiver.shared.connect_recv_selector(self.signal.clone(), token);
+        self.selections
+            .receiver
+            .shared
+            .connect_recv_selector(self.signal.clone(), token);
         self.selections.push((
             Box::new(move || match receiver.try_recv() {
                 Ok(msg) => Some((&mut f)(Ok(msg))),
@@ -122,7 +134,7 @@ impl<'a, T> Selector<'a, T> {
             // Attempt to receive a message
             if let Some(msg) = match token {
                 None => self.poll(), // Unknown event
-                Some(token) => (&mut self.selections[token].0)()
+                Some(token) => (&mut self.selections[token].0)(),
             } {
                 break msg;
             }
